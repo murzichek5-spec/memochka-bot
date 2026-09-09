@@ -1,0 +1,16 @@
+[Unit]
+Description=Memochka Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/opt/memochka
+ExecStart=/opt/memochka/.venv/bin/python /opt/memochka/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
