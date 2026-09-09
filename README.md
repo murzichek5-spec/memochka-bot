@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/banner.png" alt="Мемочка banner" width="100%">
+</p>
+
 <div align="center">
 
 # 😼 Мёмочка
@@ -9,13 +13,13 @@
 [![OpenRouter](https://img.shields.io/badge/OpenRouter-LLM-111111?style=for-the-badge)](https://openrouter.ai/)
 [![SQLite](https://img.shields.io/badge/SQLite-memory-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
 
-**Не просто отвечает на команды. Живёт внутри чата.**
+**Не просто отвечает на команды, а живёт внутри чата.**
 
 </div>
 
 ---
 
-## ✦ Что такое Мёмочка
+## ✦ Кто такая Мёмочка
 
 **Мёмочка** — Telegram-бот с характером и долговременной памятью для групповых чатов.
 Она запоминает контекст, участников и локальные приколы, умеет подстраиваться под стиль беседы, реагировать на сообщения и самостоятельно появляться в разговоре, когда это уместно.
