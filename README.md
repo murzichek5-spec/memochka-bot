@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/banner.png" alt="Мемочка banner" width="100%">
+</p>
+
 <div align="center">
 
 # 😼 Мёмочка
