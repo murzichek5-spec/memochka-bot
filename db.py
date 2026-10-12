@@ -139,6 +139,23 @@ class Database:
             """)
             await db.execute("CREATE INDEX IF NOT EXISTS idx_user_memories_chat ON user_memories(chat_id, updated_at DESC)")
 
+            # Ручные факты из /madd держим отдельно от AI-памяти. Куратор может
+            # переписывать user_memories, а то, что люди явно добавили руками,
+            # теряться из-за этого не должно.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_manual_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    fact TEXT NOT NULL,
+                    fact_norm TEXT NOT NULL,
+                    added_by INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, user_id, fact_norm)
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_user_manual_facts_user ON user_manual_facts(chat_id, user_id, id DESC)")
+
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS chat_photos (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -365,6 +382,65 @@ class Database:
             return None
         return {"user_id": int(row[0]), "username": row[1], "display_name": row[2], "message_count": int(row[3])}
 
+    async def get_user_by_id(self, chat_id: int, user_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                SELECT user_id,username,display_name,message_count FROM chat_users
+                WHERE chat_id=? AND user_id=? LIMIT 1
+            """, (chat_id, user_id))
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return {
+            "user_id": int(row[0]),
+            "username": row[1],
+            "display_name": row[2],
+            "message_count": int(row[3]),
+        }
+
+    async def get_user_activity_hours(self, chat_id: int, user_id: int) -> dict[int, int]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                SELECT CAST(strftime('%H', created_at) AS INTEGER) AS hour, COUNT(*)
+                FROM messages
+                WHERE chat_id=? AND user_id=?
+                GROUP BY hour
+                ORDER BY hour
+            """, (chat_id, user_id))
+            rows = await cur.fetchall()
+        return {int(hour): int(count) for hour, count in rows if hour is not None}
+
+    async def add_manual_fact(
+        self,
+        chat_id: int,
+        user_id: int,
+        fact: str,
+        *,
+        added_by: int | None = None,
+    ) -> bool:
+        fact = " ".join((fact or "").split()).strip()[:500]
+        if not fact:
+            return False
+        fact_norm = fact.casefold()
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                INSERT OR IGNORE INTO user_manual_facts(chat_id,user_id,fact,fact_norm,added_by)
+                VALUES(?,?,?,?,?)
+            """, (chat_id, user_id, fact, fact_norm, added_by))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def get_manual_facts(self, chat_id: int, user_id: int, *, limit: int = 8) -> list[str]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                SELECT fact FROM user_manual_facts
+                WHERE chat_id=? AND user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+            """, (chat_id, user_id, limit))
+            rows = await cur.fetchall()
+        return [str(row[0]) for row in reversed(rows)]
+
     async def get_user_memory(self, chat_id: int, user_id: int) -> dict[str, Any]:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute("""
@@ -440,6 +516,49 @@ class Database:
             "display_name": row[2],
             "message_count": int(row[3]),
         }
+
+    async def get_top_chatters(self, chat_id: int, *, limit: int = 5) -> list[dict[str, Any]]:
+        # Для красивой вкладки /mstats показываем несколько самых разговорчивых,
+        # а не только одного победителя местного чемпионата по сообщениям.
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                SELECT user_id,username,display_name,message_count
+                FROM chat_users
+                WHERE chat_id=? AND message_count>0
+                ORDER BY message_count DESC,last_seen DESC
+                LIMIT ?
+            """, (chat_id, limit))
+            rows = await cur.fetchall()
+        return [
+            {
+                "user_id": int(row[0]),
+                "username": row[1],
+                "display_name": row[2],
+                "message_count": int(row[3]),
+            }
+            for row in rows
+        ]
+
+    async def get_chat_activity_hours(self, chat_id: int) -> dict[int, int]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                SELECT CAST(strftime('%H', created_at) AS INTEGER) AS hour, COUNT(*)
+                FROM messages
+                WHERE chat_id=?
+                GROUP BY hour
+                ORDER BY hour
+            """, (chat_id,))
+            rows = await cur.fetchall()
+        return {int(hour): int(count) for hour, count in rows if hour is not None}
+
+    async def count_manual_facts(self, chat_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM user_manual_facts WHERE chat_id=?",
+                (chat_id,),
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
     async def count_messages(self, chat_id: int) -> int:
         async with aiosqlite.connect(self.path) as db:
@@ -560,7 +679,7 @@ class Database:
             cur = await db.execute("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,))
             row = await cur.fetchone()
             count = int(row[0]) if row else 0
-            for table in ("messages","conversation_log","chat_words","chat_users","user_words","user_memories","chat_photos"):
+            for table in ("messages","conversation_log","chat_words","chat_users","user_words","user_memories","user_manual_facts","chat_photos"):
                 await db.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat_id,))
             await db.commit()
         return count

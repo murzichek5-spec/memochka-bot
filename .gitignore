@@ -32,3 +32,9 @@ Thumbs.db
 # Generated media / temp
 *.tmp
 *.temp
+
+.env
+bot.db
+logs/
+__pycache__/
+*.pyc

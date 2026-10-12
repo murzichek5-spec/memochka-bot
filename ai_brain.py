@@ -25,6 +25,7 @@ from prompts import (
     SHORT_REACTION_SYSTEM_SUFFIX,
     MEMORY_CURATOR_SYSTEM,
     PARODY_SYSTEM_PROMPT,
+    HISTORY_RECAP_SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,21 @@ class AIBrain:
             json_mode=False,
         )
         result.text = self.clean_text(result.text, lowercase=True, max_chars=1800)
+        return result
+
+    async def generate_history_recap(self, *, user_prompt: str) -> AIResult:
+        # /mhis должен быть понятным пересказом, а не творческим фанфиком.
+        # Поэтому температура ниже обычной болтовни и лимит чуть больше.
+        result = await self._chat(
+            system=HISTORY_RECAP_SYSTEM_PROMPT,
+            user=user_prompt,
+            temperature=0.45,
+            top_p=0.9,
+            max_tokens=520,
+            presence_penalty=0.0,
+            json_mode=False,
+        )
+        result.text = self.clean_text(result.text, lowercase=True, max_chars=3400)
         return result
 
     async def generate_parody(self, *, user_prompt: str, temperature: float) -> AIResult:

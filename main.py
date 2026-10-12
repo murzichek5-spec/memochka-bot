@@ -41,7 +41,7 @@ from demotivator import make_demotivator
 from quote_card import make_quote_card
 from memory import MemoryCurator, MemoryObservation
 from memory_store import GroupMemoryStore
-from prompts import intervention_user_prompt, parody_user_prompt, reply_user_prompt
+from prompts import history_recap_user_prompt, intervention_user_prompt, parody_user_prompt, reply_user_prompt
 
 # Поднимаем зависимости один раз на процесс. Тут видно всю цепочку проекта:
 # конфиг -> БД/память -> AI -> Telegram router. Никакой скрытой магии.
@@ -67,6 +67,7 @@ LAST_AUTO_ACTION_AT: dict[int, float] = {}
 LAST_AI_CHECK_AT: dict[int, float] = {}
 RECENT_LIVE_MESSAGES: dict[int, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=64))
 PENDING_AUTO_TASKS: dict[int, asyncio.Task] = {}
+LATEST_AUTO_MESSAGES: dict[int, Message] = {}
 ACTIVE_GROUP_CHATS: set[int] = set()
 LAST_HUMAN_MESSAGE_AT: dict[int, float] = {}
 LAST_IDLE_ATTEMPT_AT: dict[int, float] = {}
@@ -603,30 +604,42 @@ async def execute_auto_intervention(
 
 
 def cancel_scheduled_intervention(chat_id: int) -> None:
-    # Debounce: новое сообщение делает старый таймер неактуальным. Отменяем его,
-    # иначе бот может внезапно ответить на тему, которая уже пять сообщений как закончилась.
+    # Явная отмена: direct reply, /silent или остановка бота.
+    # Обычные новые сообщения сюда больше не попадают.
+    LATEST_AUTO_MESSAGES.pop(chat_id, None)
     task = PENDING_AUTO_TASKS.pop(chat_id, None)
     if task and not task.done():
         task.cancel()
 
 
 def schedule_delayed_intervention(bot: Bot, chat_id: int, current: Message) -> None:
-    # Главный трюк автономности: после каждого сообщения ждём естественную паузу.
-    # Если люди продолжают писать — таймер переносится. Бот вклинивается между кусками разговора,
-    # а не между двумя сообщениями одного человека.
-    cancel_scheduled_intervention(chat_id)
+    # Один таймер на чат. Новые сообщения обновляют контекст, но не сдвигают
+    # первоначальный deadline. Так активный разговор не может бесконечно
+    # откладывать проверку AI.
+    LATEST_AUTO_MESSAGES[chat_id] = current
+    task = PENDING_AUTO_TASKS.get(chat_id)
+    if task is not None and not task.done():
+        return
+
+    cap = max(1.0, float(settings.auto_max_wait_seconds))
     low = max(1.0, min(settings.auto_delay_min_seconds, settings.auto_delay_max_seconds))
     high = max(low, settings.auto_delay_max_seconds)
-    delay = random.uniform(low, high)
-    logging.getLogger(__name__).debug("Авто-вмешательство запланировано: chat=%s delay=%.1fs", chat_id, delay)
-    PENDING_AUTO_TASKS[chat_id] = asyncio.create_task(delayed_auto_intervention(bot, chat_id, current, delay))
+    delay = min(random.uniform(low, high), cap)
+    logging.getLogger(__name__).debug(
+        "Авто-вмешательство запланировано: chat=%s delay=%.1fs (max=%.1fs)",
+        chat_id, delay, cap,
+    )
+    PENDING_AUTO_TASKS[chat_id] = asyncio.create_task(
+        delayed_auto_intervention(bot, chat_id, current, delay)
+    )
 
 
 async def delayed_auto_intervention(bot: Bot, chat_id: int, current: Message, delay: float) -> None:
-    # Фильтры до AI экономят деньги и нервы: silent mode, мало сообщений, cooldown,
-    # не выпал шанс — сразу выходим. Гонять модель ради гарантированного молчания нахер не надо.
+    # Фильтры до AI экономят запросы: silent mode, мало сообщений, cooldown,
+    # не выпал шанс — сразу выходим. Время ожидания при этом не переносится.
     try:
         await asyncio.sleep(delay)
+        current = LATEST_AUTO_MESSAGES.get(chat_id, current)
         s = await chat_settings(chat_id)
         if not bool(s["auto_enabled"]):
             return
@@ -642,6 +655,10 @@ async def delayed_auto_intervention(bot: Bot, chat_id: int, current: Message, de
             return
 
         chance = dynamic_auto_probability(chat_id, base_chance, current)
+        logging.getLogger(__name__).debug(
+            "Авто-проверка: chat=%s chance=%.3f message_id=%s",
+            chat_id, chance, current.message_id,
+        )
         if random.random() > chance:
             return
         LAST_AI_CHECK_AT[chat_id] = now
@@ -666,6 +683,7 @@ async def delayed_auto_intervention(bot: Bot, chat_id: int, current: Message, de
     finally:
         if PENDING_AUTO_TASKS.get(chat_id) is asyncio.current_task():
             PENDING_AUTO_TASKS.pop(chat_id, None)
+            LATEST_AUTO_MESSAGES.pop(chat_id, None)
 
 
 async def idle_chat_loop(bot: Bot) -> None:
@@ -728,26 +746,46 @@ async def try_reaction(bot: Bot, chat_id: int, message_id: int, emoji: str) -> b
     return False
 
 
+def render_help_text() -> str:
+    return "\n".join([
+        "🟣 МЁМОЧКА",
+        "",
+        "живу в этом чате, помню ваши приколы и иногда сама лезу в разговор",
+        "",
+        "💬 ЧАТ",
+        "/mhis — что происходило в недавней переписке",
+        "/mstats — статистика чата",
+        "/mprof — профиль участника",
+        "/madd — добавить факт в карточку участника (админ)",
+        "",
+        "🖼 МЕДИА",
+        "/mcit — карточка-цитата по reply",
+        "/mdem — демотиватор из фото или памяти",
+        "/mgen — реплика в стиле чата",
+        "/mgen @username — пародия на участника",
+        "",
+        "⚙️ НАСТРОЙКИ",
+        "/mset — самостоятельность и хаос (админ)",
+        "/mtest — диагностика автономности (админ)",
+        "",
+        "🧠 ПАМЯТЬ",
+        "/mforget — стереть память текущего чата (админ)",
+        "",
+        "🔗 ПРОЧЕЕ",
+        "/mvpn — маркевич впн",
+        "",
+        "подсказка: /mprof и /madd удобнее всего использовать reply на сообщение человека",
+    ])
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "йо, я мёмочка. живу в этом чате, помню ваши приколы, иногда сама влезаю в разговор и периодически делаю хуйню из ваших фоток 😼\n\n"
-        "команды:\n"
-        "/mgen — реплика в стиле чата\n"
-        "/mgen @username — пародия на участника\n"
-        "/mdem — демотиватор из фото или памяти чата\n"
-        "/mcit — карточка-цитата по reply\n"
-        "/mstats — память и статистика\n"
-        "/mset — настройки самостоятельности\n"
-        "/mvpn — маркевич впн\n"
-        "/mforget — стереть память текущего чата (админ)\n"
-        "/mhelp — показать эту подсказку"
-    )
+    await message.answer(render_help_text())
 
 
 @router.message(Command("mhelp"))
 async def cmd_help(message: Message) -> None:
-    await cmd_start(message)
+    await message.answer(render_help_text())
 
 
 def settings_main_keyboard(auto_enabled: bool) -> InlineKeyboardMarkup:
@@ -925,46 +963,457 @@ def _chat_diagnosis(*, messages: int, memes: int, chaos: float, photos: int) -> 
     return random.choice(variants)
 
 
-@router.message(Command("mstats"))
-async def cmd_stats(message: Message) -> None:
+@router.message(Command("mtest"))
+async def cmd_mtest(message: Message, bot: Bot) -> None:
+    """Быстрая диагностика всей автономной цепочки без ожидания рандомных таймеров."""
+    if not await is_chat_admin(message, bot):
+        await message.answer("диагностика только для админов")
+        return
+
     chat_id = message.chat.id
+    started = time.monotonic()
+
+    # Telegram уже отвечает нам самой командой, но get_me дополнительно проверяет API.
+    try:
+        me = await bot.get_me()
+        telegram_line = f"✅ @{me.username or me.id}"
+    except Exception as exc:
+        telegram_line = f"❌ {type(exc).__name__}: {str(exc)[:160]}"
+
+    try:
+        message_count = await db.count_messages(chat_id)
+        photo_count = await db.count_photos(chat_id)
+        db_line = f"✅ {_pretty_num(message_count)} сообщ. · {_pretty_num(photo_count)} фоток"
+    except Exception as exc:
+        message_count = 0
+        db_line = f"❌ {type(exc).__name__}: {str(exc)[:160]}"
+
+    try:
+        s = await chat_settings(chat_id)
+        auto_enabled = bool(s["auto_enabled"])
+        chance = float(s["auto_reply_chance"])
+    except Exception:
+        auto_enabled = False
+        chance = settings.default_auto_reply_chance
+
+    pending = PENDING_AUTO_TASKS.get(chat_id)
+    pending_alive = bool(pending and not pending.done())
+    in_active_pool = chat_id in ACTIVE_GROUP_CHATS
+    threshold_ok = message_count >= settings.min_messages_for_auto_reply
+
+    # Проверяем OpenRouter настоящим коротким запросом. В prompt не суём историю чата,
+    # поэтому /mtest не тратит лишние токены и не зависит от intervention JSON.
+    ai_started = time.monotonic()
+    ai_result = await ai._chat(
+        system="Ты healthcheck. Ответь только словом ok.",
+        user="ok",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=16,
+        presence_penalty=0.0,
+        json_mode=False,
+    )
+    ai_elapsed = time.monotonic() - ai_started
+    if ai_result.error:
+        ai_line = f"❌ {ai_result.error[:700]}"
+        model_used = ai_result.model_used or settings.openrouter_model
+        health_text = "—"
+    else:
+        ai_line = f"✅ ответ за {ai_elapsed:.2f} сек"
+        model_used = ai_result.model_used or settings.openrouter_model
+        health_text = (ai_result.text or "").strip()[:100] or "(пустой ответ)"
+
+    if not auto_enabled:
+        verdict = "самостоятельность выключена — включи её в /mset"
+    elif not threshold_ok:
+        verdict = "пока мало сообщений для автономности — докинь обычных сообщений в чат"
+    elif ai_result.error:
+        verdict = "бот жив, но ai-запрос не проходит — автономные реплики из-за этого будут молчать"
+    elif not in_active_pool:
+        verdict = "openrouter жив, но этот чат ещё не попал в active-пул после запуска. отправь обычное сообщение"
+    elif not pending_alive:
+        verdict = "основная цепочка жива, но прямо сейчас delayed-task не запланирован. отправь обычное сообщение и повтори /mtest через несколько секунд"
+    else:
+        verdict = "основная цепочка выглядит живой. delayed-task стоит и openrouter отвечает"
+
+    text = "\n".join([
+        "🧪 ДИАГНОСТИКА МЁМОЧКИ",
+        "",
+        f"telegram: {telegram_line}",
+        f"база: {db_line}",
+        f"самостоятельность: {'✅ вкл' if auto_enabled else '❌ выкл'}",
+        f"шанс вмешательства: {chance * 100:.0f}%",
+        f"минимум сообщений для авто: {settings.min_messages_for_auto_reply}",
+        f"авто-порог: {'✅ пройден' if threshold_ok else '❌ не пройден'}",
+        f"чат в active-пуле: {'✅' if in_active_pool else '⚠️ нет'}",
+        f"delayed-task: {'✅ запланирован' if pending_alive else '— сейчас нет'}",
+        "",
+        "🌐 OPENROUTER",
+        f"модель: {settings.openrouter_model}",
+        f"api: {ai_line}",
+        f"model_used: {model_used}",
+        f"ответ healthcheck: {health_text}",
+        "",
+        "ИТОГ",
+        verdict,
+        "",
+        f"диагностика заняла {time.monotonic() - started:.2f} сек",
+    ])
+    await message.answer(text)
+
+
+@router.message(Command("mhis"))
+async def cmd_history(message: Message, bot: Bot) -> None:
+    """Коротко пересказывает недавнюю историю чата.
+
+    /mhis       -> последние 80 сообщений
+    /mhis 150   -> последние 150 сообщений
+
+    Число специально ограничено: если скормить модели весь чат с рождения,
+    получится дорого, медленно и обычно менее полезно.
+    """
+    raw = (message.text or "").split(maxsplit=1)
+    requested = 80
+    if len(raw) > 1:
+        arg = raw[1].strip()
+        try:
+            requested = int(arg)
+        except ValueError:
+            await message.answer("пиши типа /mhis 120 — число это сколько последних сообщений пересказать")
+            return
+
+    requested = max(20, min(requested, 200))
+    events = await db.get_recent_context(
+        message.chat.id,
+        limit=requested,
+        exclude_message_id=message.message_id,
+    )
+
+    # Один-два сообщения пересказывать — это уже не recap, а пересказ пересказа.
+    if len(events) < 3:
+        await message.answer("я тут пока почти нихуя не накопила, пересказывать нечего")
+        return
+
+    context = "\n\n".join(format_event(event) for event in events)
+    prompt = history_recap_user_prompt(context=context, message_count=len(events))
+
+    try:
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
+
+    result = await ai.generate_history_recap(user_prompt=prompt)
+    if result.text:
+        await message.answer("🕰 чё вы тут устроили\n\n" + result.text)
+        return
+
+    logging.getLogger(__name__).warning("/mhis AI error: %s", result.error)
+
+    # OpenRouter лёг — команда всё равно должна дать хоть что-то полезное.
+    # Показываем последние человеческие реплики без попытки умничать.
+    fallback: list[str] = []
+    for event in events[-8:]:
+        if bool(event.get("is_bot")):
+            continue
+        name = event.get("display_name") or (f"@{event['username']}" if event.get("username") else "кто-то")
+        body = " ".join(str(event.get("text") or "").split())
+        if body:
+            fallback.append(f"• {name}: {body[:180]}")
+
+    if fallback:
+        await message.answer(
+            "мозг щас не отвечает, так что вот последние реплики без пересказа:\n\n"
+            + "\n".join(fallback)
+        )
+    else:
+        await message.answer("мозг щас не отвечает, а нормальной истории для fallback нет")
+
+
+PROFILE_STOP_WORDS = {
+    "я", "ты", "он", "она", "мы", "вы", "они", "и", "а", "но",
+    "не", "да", "нет", "ну", "это", "в", "во", "на", "с", "со",
+    "к", "у", "по", "за", "из", "от", "до", "что", "че", "чо",
+    "как", "так", "там", "тут", "то", "же", "ли", "бы", "мне",
+    "меня", "тебя", "тебе", "его", "ее", "их", "мой", "твой",
+}
+
+
+def _profile_top_word(word_counts: dict[str, int]) -> tuple[str | None, int]:
+    command_words = {
+        "mgen", "mdem", "mcit", "mstats", "mprof", "madd", "mhis",
+        "mtest", "mset", "mvpn", "mhelp", "mforget",
+    }
+    for word, amount in word_counts.items():
+        clean = word.strip().casefold()
+        if len(clean) < 2 or clean.isdigit() or clean in PROFILE_STOP_WORDS or clean in command_words:
+            continue
+        return word.strip(), int(amount)
+    return None, 0
+
+
+def _profile_daypart(hours: dict[int, int], message_count: int) -> str:
+    if message_count < 8 or not hours:
+        return "мало данных"
+    buckets = {
+        "ночью": sum(count for hour, count in hours.items() if hour < 6),
+        "утром": sum(count for hour, count in hours.items() if 6 <= hour < 12),
+        "днём": sum(count for hour, count in hours.items() if 12 <= hour < 18),
+        "вечером": sum(count for hour, count in hours.items() if 18 <= hour < 24),
+    }
+    return max(buckets, key=buckets.get)
+
+
+def _profile_memory_lines(memory: str, limit: int = 4) -> list[str]:
+    raw = (memory or "").replace("\r", "\n")
+    parts: list[str] = []
+    for line in raw.split("\n"):
+        clean = re.sub(r"^[\s•*—-]+", "", line).strip()
+        if clean and clean not in parts:
+            parts.append(clean)
+        if len(parts) >= limit:
+            break
+    return parts
+
+
+def _profile_local_status(*, user_id: int, messages: int, daypart: str, top_word: str | None, memories: int) -> str:
+    expressive = {"бля", "блять", "пиздец", "нахуй", "хуй", "сука", "ебать"}
+    if messages < 8:
+        return "пока загадочный тип, компромата мало"
+    if top_word and top_word.casefold() in expressive:
+        return "специалист по выразительной лексике"
+    if messages >= 1000:
+        return "штатный поставщик сообщений"
+    if daypart == "ночью":
+        return "дежурный по ночному чату"
+    if memories >= 4:
+        return "я про него уже подозрительно много знаю"
+    variants = [
+        "стабильный участник местного цирка",
+        "в базе есть, значит пути назад уже нет",
+        "пока ведёт себя подозрительно нормально",
+        "официально замечен в этом чате",
+        "локальный источник контента",
+    ]
+    return variants[abs(int(user_id)) % len(variants)]
+
+
+async def _resolve_profile_target(message: Message, *, allow_self: bool = True) -> dict[str, Any] | None:
+    # reply удобнее всего на телефоне, поэтому он имеет высший приоритет.
+    if message.reply_to_message and message.reply_to_message.from_user:
+        user = message.reply_to_message.from_user
+        profile = await db.get_user_by_id(message.chat.id, user.id)
+        if profile:
+            return profile
+        return {
+            "user_id": user.id,
+            "username": user.username,
+            "display_name": user.full_name,
+            "message_count": 0,
+        }
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) >= 2 and parts[1].strip().startswith("@"):
+        return await db.get_user_by_username(message.chat.id, parts[1].strip())
+
+    if allow_self and message.from_user:
+        profile = await db.get_user_by_id(message.chat.id, message.from_user.id)
+        if profile:
+            return profile
+        return {
+            "user_id": message.from_user.id,
+            "username": message.from_user.username,
+            "display_name": message.from_user.full_name,
+            "message_count": 0,
+        }
+    return None
+
+
+@router.message(Command("mprof"))
+async def cmd_profile(message: Message) -> None:
+    profile = await _resolve_profile_target(message)
+    if not profile:
+        await message.answer("я хз кого профилировать. ответь командой на сообщение или напиши /mprof @username")
+        return
+
+    user_id = int(profile["user_id"])
+    memory = await db.get_user_memory(message.chat.id, user_id)
+    manual_facts = await db.get_manual_facts(message.chat.id, user_id, limit=6)
+    words = await db.get_word_counts(message.chat.id, user_id=user_id, limit=100)
+    hours = await db.get_user_activity_hours(message.chat.id, user_id)
+
+    message_count = int(profile.get("message_count") or 0)
+    top_word, top_count = _profile_top_word(words)
+    daypart = _profile_daypart(hours, message_count)
+    memories = _profile_memory_lines(str(memory.get("memory") or ""), limit=4)
+
+    username = profile.get("username") or memory.get("username")
+    display_name = profile.get("display_name") or memory.get("display_name")
+    known_name = str(memory.get("known_name") or "").strip()
+    label = f"@{username}" if username else str(display_name or known_name or f"user{user_id}")
+
+    status = _profile_local_status(
+        user_id=user_id,
+        messages=message_count,
+        daypart=daypart,
+        top_word=top_word,
+        memories=len(memories) + len(manual_facts),
+    )
+
+    # Профиль теперь выглядит как одна аккуратная карточка, а не дамп SQL-строк.
+    # Без inline-кнопок: открыл, посмотрел, пошёл дальше.
+    fact_lines = ["📌 В КАРТОЧКЕ"] + (
+        [f"• {_clean_stat_fragment(item, 90)}" for item in manual_facts]
+        if manual_facts else ["• пока пусто"]
+    )
+
+    memory_lines = ["🧠 МЁМОЧКА ПОМНИТ"]
+    if known_name and known_name.casefold() not in label.casefold():
+        memory_lines.append(f"• говорит, что его зовут {known_name}")
+    memory_lines.extend(f"• {_clean_stat_fragment(item, 82)}" for item in memories)
+    if len(memory_lines) == 1:
+        memory_lines.append("• пока ничего конкретного")
+
+    word_line = (
+        f"🗯 «{top_word}» · {_pretty_num(top_count)} раз"
+        if top_word else "🗯 любимое слово пока не спалилось"
+    )
+
+    text = "\n".join([
+        f"👤 {label}",
+        "━━━━━━━━━━━━",
+        "",
+        f"💬 {_pretty_num(message_count)} сообщений",
+        word_line,
+        (f"🕒 чаще пишет {daypart}" if daypart != "мало данных" else "🕒 по времени пока мало данных"),
+        "",
+        *fact_lines,
+        "",
+        *memory_lines,
+        "",
+        "━━━━━━━━━━━━",
+        f"🏷 {status}",
+    ])
+    await message.answer(text)
+
+
+
+@router.message(Command("madd"))
+async def cmd_add_profile_fact(message: Message, bot: Bot) -> None:
+    # Чужая карточка — штука общая для всего чата. Поэтому не даём любому человеку
+    # вписать туда "вася ест детей" и потом делать вид, что это память бота.
+    if not await is_chat_admin(message, bot):
+        await message.answer("добавлять факты в чужие карточки могут только админы")
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=2)
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = await _resolve_profile_target(message, allow_self=False)
+        # В reply-режиме всё после команды — это факт.
+        fact = raw.split(maxsplit=1)[1].strip() if len(raw.split(maxsplit=1)) > 1 else ""
+    elif len(parts) >= 3 and parts[1].startswith("@"):
+        target = await db.get_user_by_username(message.chat.id, parts[1])
+        fact = parts[2].strip()
+    else:
+        await message.answer(
+            "пиши так: /madd @username любит собачек\n"
+            "или ответь на сообщение человека: /madd любит собачек"
+        )
+        return
+
+    if not target:
+        await message.answer("я такого @username ещё не знаю. пусть он сначала хоть что-нибудь напишет или используй reply")
+        return
+
+    fact = " ".join(fact.split()).strip()
+    if len(fact) < 2:
+        await message.answer("сам факт-то напиши 😭")
+        return
+    if len(fact) > 500:
+        await message.answer("это уже не факт, а биография. уложись примерно в 500 символов")
+        return
+
+    added = await db.add_manual_fact(
+        message.chat.id,
+        int(target["user_id"]),
+        fact,
+        added_by=message.from_user.id if message.from_user else None,
+    )
+
+    username = target.get("username")
+    label = f"@{username}" if username else str(target.get("display_name") or f"user{target['user_id']}")
+    if added:
+        await message.answer(f"запомнила про {label}: {fact}")
+    else:
+        await message.answer(f"это про {label} уже есть в карточке")
+
+
+def stats_keyboard(active: str = "overview") -> InlineKeyboardMarkup:
+    labels = {
+        "overview": "📊 Обзор",
+        "people": "👥 Люди",
+        "words": "🔥 Слова",
+        "memory": "🧠 Память",
+    }
+
+    def button(key: str) -> InlineKeyboardButton:
+        prefix = "• " if key == active else ""
+        return InlineKeyboardButton(
+            text=prefix + labels[key],
+            callback_data=f"mstats:{key}",
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [button("overview"), button("people")],
+        [button("words"), button("memory")],
+        [InlineKeyboardButton(text="✖️ Закрыть", callback_data="mstats:close")],
+    ])
+
+
+def _stats_top_words(word_counts: dict[str, int], *, limit: int = 5) -> list[tuple[str, int]]:
+    ignored = {
+        "mgen", "mdem", "mcit", "mstats", "mprof", "madd", "mhis",
+        "mtest", "mset", "mvpn", "mhelp", "mforget",
+    }
+    result: list[tuple[str, int]] = []
+    for word, amount in word_counts.items():
+        clean = word.strip()
+        if len(clean) < 2 or clean.casefold() in ignored or clean.isdigit():
+            continue
+        result.append((clean, int(amount)))
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _activity_peak(hours: dict[int, int]) -> str:
+    if not hours:
+        return "пока не определился"
+    hour = max(hours, key=hours.get)
+    return f"{hour:02d}:00–{(hour + 1) % 24:02d}:00"
+
+
+def _progress_bar(value: float, *, blocks: int = 10) -> str:
+    value = max(0.0, min(1.0, float(value)))
+    filled = round(value * blocks)
+    return "█" * filled + "░" * (blocks - filled)
+
+
+async def render_stats_view(chat_id: int, view: str = "overview") -> str:
     count = await db.count_messages(chat_id)
     total_words, unique_words = await db.get_word_stats(chat_id)
     participants = await db.count_chat_users(chat_id)
     gm_count, meme_count = await group_memory.stats(chat_id)
     user_mem_count = await db.count_user_memories(chat_id)
+    manual_fact_count = await db.count_manual_facts(chat_id)
     photo_count = await db.count_photos(chat_id)
-    top_chatter = await db.get_top_chatter(chat_id)
+    word_counts = await db.get_word_counts(chat_id, limit=80)
+    top_words = _stats_top_words(word_counts, limit=5)
+    top_chatters = await db.get_top_chatters(chat_id, limit=5)
+    activity_hours = await db.get_chat_activity_hours(chat_id)
     top_meme = await group_memory.top_meme(chat_id)
-    word_counts = await db.get_word_counts(chat_id, limit=30)
     s = await chat_settings(chat_id)
-
-    # Команды, цифры и совсем короткая ерунда в "слово чата" не тащим.
-    # Иначе победит какая-нибудь "mgen" или "123", что выглядит уныло.
-    top_word = None
-    top_word_count = 0
-    for word, amount in word_counts.items():
-        clean = word.strip()
-        if len(clean) < 2 or clean.startswith("m") and clean in {"mgen", "mdem", "mcit", "mstats", "mset", "mvpn", "mhelp", "mforget"}:
-            continue
-        if clean.isdigit():
-            continue
-        top_word = clean
-        top_word_count = int(amount)
-        break
-
-    top_word_line = (
-        f'слово чата: “{top_word}” ×{_pretty_num(top_word_count)}'
-        if top_word else "слово чата: пока не определилось"
-    )
-    chatter_line = (
-        f"главный спамер: {_stats_user_label(top_chatter)} — {_pretty_num(int(top_chatter['message_count']))} сообщ."
-        if top_chatter else "главный спамер: пока никто"
-    )
-    meme_line = (
-        f'локальный мем: “{_clean_stat_fragment(top_meme.text)}” ×{top_meme.occurrences}'
-        if top_meme else "локальный мем: ещё не родился"
-    )
 
     diagnosis = _chat_diagnosis(
         messages=count,
@@ -973,32 +1422,139 @@ async def cmd_stats(message: Message) -> None:
         photos=photo_count,
     )
 
-    stats_text = "\n".join([
-        "📊 ЧАТ",
+    if view == "people":
+        medals = ["🥇", "🥈", "🥉", "4.", "5."]
+        people_lines = []
+        for idx, person in enumerate(top_chatters):
+            people_lines.append(
+                f"{medals[idx]} {_stats_user_label(person)} — {_pretty_num(int(person['message_count']))}"
+            )
+        if not people_lines:
+            people_lines.append("пока тут подозрительно тихо")
+
+        return "\n".join([
+            "👥 УЧАСТНИКИ",
+            "━━━━━━━━━━━━",
+            "",
+            *people_lines,
+            "",
+            f"👤 замечено участников: {_pretty_num(participants)}",
+            f"🕒 пик активности чата: {_activity_peak(activity_hours)}",
+            "",
+            "нажал на статистику и официально стал частью исследования",
+        ])
+
+    if view == "words":
+        word_lines = [
+            f"{idx}. «{word}» — {_pretty_num(amount)}"
+            for idx, (word, amount) in enumerate(top_words, start=1)
+        ]
+        if not word_lines:
+            word_lines.append("слов пока недостаточно для компромата")
+
+        meme_line = (
+            f"«{_clean_stat_fragment(top_meme.text, 70)}» ×{top_meme.occurrences}"
+            if top_meme else "ещё не родился"
+        )
+
+        return "\n".join([
+            "🔥 СЛОВА И ПРИКОЛЫ",
+            "━━━━━━━━━━━━",
+            "",
+            *word_lines,
+            "",
+            f"🧩 локальный мем: {meme_line}",
+            f"📚 уникальных слов: {_pretty_num(unique_words)}",
+            "",
+            "лингвисты уже выехали",
+        ])
+
+    if view == "memory":
+        auto_enabled = bool(s["auto_enabled"])
+        chance = float(s["auto_reply_chance"])
+        chaos = float(s["chaos"])
+        return "\n".join([
+            "🧠 ПАМЯТЬ И МЁМОЧКА",
+            "━━━━━━━━━━━━",
+            "",
+            f"👤 карточек людей: {_pretty_num(user_mem_count)}",
+            f"📌 ручных фактов: {_pretty_num(manual_fact_count)}",
+            f"💭 воспоминаний чата: {_pretty_num(gm_count)}",
+            f"📸 сохранённых фоток: {_pretty_num(photo_count)}",
+            "",
+            f"🤖 самостоятельность: {'✅ включена' if auto_enabled else '❌ выключена'}",
+            f"🎯 вмешательство  {_progress_bar(chance)} {chance * 100:.0f}%",
+            f"🌀 хаос          {_progress_bar(chaos)} {chaos * 100:.0f}%",
+            f"💬 короткие реакции: {settings.short_reaction_chance * 100:.0f}%",
+            f"🖼 авто-демотиваторы: {'✅' if settings.auto_demotivators_enabled else '❌'}",
+            "",
+            "памяти становится больше, алиби — меньше",
+        ])
+
+    top_word_line = (
+        f"«{top_words[0][0]}» ×{_pretty_num(top_words[0][1])}"
+        if top_words else "пока не определилось"
+    )
+    chatter_line = (
+        f"{_stats_user_label(top_chatters[0])} · {_pretty_num(int(top_chatters[0]['message_count']))}"
+        if top_chatters else "пока никто"
+    )
+
+    return "\n".join([
+        "📊 СТАТИСТИКА ЧАТА",
+        "━━━━━━━━━━━━",
+        "",
+        "💬 АКТИВНОСТЬ",
         f"{_pretty_num(count)} сообщений",
         f"{_pretty_num(total_words)} слов · {_pretty_num(unique_words)} уникальных",
         f"{_pretty_num(participants)} участников",
         "",
+        "🔥 СЕЙЧАС В ТОПЕ",
+        f"🗯 слово: {top_word_line}",
+        f"👑 главный спамер: {chatter_line}",
+        f"🕒 пик активности: {_activity_peak(activity_hours)}",
+        "",
         "🧠 ПАМЯТЬ",
-        f"{_pretty_num(user_mem_count)} карточек людей",
-        f"{_pretty_num(gm_count)} воспоминаний",
-        f"{_pretty_num(photo_count)} фоток",
+        f"{_pretty_num(user_mem_count)} карточек · {_pretty_num(gm_count)} воспоминаний · {_pretty_num(photo_count)} фоток",
         "",
-        "🔥 ТОПЫ",
-        top_word_line,
-        chatter_line,
-        meme_line,
-        "",
-        "🤖 МЁМОЧКА",
-        f"самостоятельность: {'✅' if bool(s['auto_enabled']) else '❌'}",
-        f"шанс вмешательства: {float(s['auto_reply_chance']) * 100:.0f}%",
-        f"хаос: {float(s['chaos']) * 100:.0f}%",
-        f"короткие реакции: {settings.short_reaction_chance * 100:.0f}%",
-        f"авто-демотиваторы: {'✅' if settings.auto_demotivators_enabled else '❌'}",
-        "",
+        "━━━━━━━━━━━━",
         f"диагноз: {diagnosis}",
     ])
-    await message.answer(stats_text)
+
+
+@router.message(Command("mstats"))
+async def cmd_stats(message: Message) -> None:
+    await message.answer(
+        await render_stats_view(message.chat.id, "overview"),
+        reply_markup=stats_keyboard("overview"),
+    )
+
+
+@router.callback_query(F.data.startswith("mstats:"))
+async def on_stats_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    action = (callback.data or "").split(":", 1)[1]
+    if action == "close":
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("закрыл")
+        return
+
+    if action not in {"overview", "people", "words", "memory"}:
+        await callback.answer()
+        return
+
+    text = await render_stats_view(callback.message.chat.id, action)
+    try:
+        await callback.message.edit_text(text, reply_markup=stats_keyboard(action))
+    except TelegramBadRequest as exc:
+        # Повторный тык по уже открытой вкладке Telegram считает ошибкой
+        # "message is not modified". Для пользователя это вообще не ошибка.
+        if "message is not modified" not in str(exc).casefold():
+            raise
+    await callback.answer()
 
 
 @router.message(Command("mgen"))
@@ -1318,11 +1874,15 @@ async def main() -> None:
             BotCommand(command="mgen", description="спиздануть что-нибудь / пародия на @username"),
             BotCommand(command="mdem", description="демотиватор из фото или памяти чата"),
             BotCommand(command="mcit", description="карточка-цитата по reply"),
-            BotCommand(command="mstats", description="память и статистика"),
+            BotCommand(command="mstats", description="интерактивная статистика чата"),
+            BotCommand(command="mprof", description="профиль участника чата"),
+            BotCommand(command="madd", description="добавить факт в карточку участника"),
+            BotCommand(command="mhis", description="что происходило в недавней переписке"),
+            BotCommand(command="mtest", description="диагностика автономности"),
             BotCommand(command="mset", description="настройки самостоятельности"),
             BotCommand(command="mvpn", description="Маркевич ВПН"),
             BotCommand(command="mforget", description="стереть память чата"),
-            BotCommand(command="mhelp", description="помощь"),
+            BotCommand(command="mhelp", description="все команды мёмочки"),
         ])
         logging.info("Memochka autonomous patch started: @%s, model=%s", BOT_USERNAME, settings.openrouter_model)
         idle_task = asyncio.create_task(idle_chat_loop(bot))
@@ -1336,6 +1896,7 @@ async def main() -> None:
             if PENDING_AUTO_TASKS:
                 await asyncio.gather(*PENDING_AUTO_TASKS.values(), return_exceptions=True)
             PENDING_AUTO_TASKS.clear()
+            LATEST_AUTO_MESSAGES.clear()
     finally:
         await curator.close()
         await ai.close()
